@@ -17,6 +17,7 @@
 
 import math
 
+from gi.repository import Gdk
 from gi.repository import Gtk
 
 from meld.misc import get_common_theme
@@ -52,21 +53,18 @@ class LinkMap(Gtk.DrawingArea):
         if not self.filediff:
             return
 
-        context.set_line_width(1.0)
-        allocation = self.get_allocation()
-
         pix_start = [t.get_visible_rect().y for t in self.views]
         y_offset = [
             t.translate_coordinates(self, 0, 0)[1] + 1 for t in self.views]
 
         clip_y = min(y_offset) - 1
         clip_height = max(t.get_visible_rect().height for t in self.views) + 2
-        context.rectangle(0, clip_y, allocation.width, clip_height)
-        context.clip()
+        allocation = self.get_allocation()
 
         stylecontext = self.get_style_context()
         Gtk.render_background(
             stylecontext, context, 0, clip_y, allocation.width, clip_height)
+        context.set_line_width(1.0)
 
         height = allocation.height
         visible = [self.views[0].get_line_num_for_y(pix_start[0]),
@@ -76,7 +74,7 @@ class LinkMap(Gtk.DrawingArea):
 
         wtotal = allocation.width
         # For bezier control points
-        x_steps = [-0.5, (1. / 3) * wtotal, (2. / 3) * wtotal, wtotal + 0.5]
+        x_steps = [-0.5, wtotal / 2, wtotal / 2, wtotal + 0.5]
         q_rad = math.pi / 2
 
         left, right = self.view_indices
@@ -116,16 +114,16 @@ class LinkMap(Gtk.DrawingArea):
                                  x_steps[0], f1 - 0.5)
                 context.close_path()
 
-            context.set_source_rgba(*self.fill_colors[c[0]])
+            Gdk.cairo_set_source_rgba(context, self.fill_colors[c[0]])
             context.fill_preserve()
 
             chunk_idx = self.filediff.linediffer.locate_chunk(left, c[1])[0]
             if chunk_idx == self.filediff.cursor.chunk:
                 highlight = self.fill_colors['current-chunk-highlight']
-                context.set_source_rgba(*highlight)
+                Gdk.cairo_set_source_rgba(context, highlight)
                 context.fill_preserve()
 
-            context.set_source_rgba(*self.line_colors[c[0]])
+            Gdk.cairo_set_source_rgba(context, self.line_colors[c[0]])
             context.stroke()
 
     def do_scroll_event(self, event):

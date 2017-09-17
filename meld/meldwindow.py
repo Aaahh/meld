@@ -33,10 +33,10 @@ from . import vcview
 from .ui import gnomeglade
 from .ui import notebooklabel
 
-from .util.compat import string_types
 from meld.conf import _, is_darwin
 from meld.recent import recent_comparisons
 from meld.settings import interface_settings, settings
+from meld.windowstate import SavedWindowState
 
 
 class MeldWindow(gnomeglade.Component):
@@ -139,7 +139,7 @@ class MeldWindow(gnomeglade.Component):
         # Manually handle shells that don't show an application menu
         gtk_settings = Gtk.Settings.get_default()
         if not gtk_settings.props.gtk_shell_shows_app_menu or is_darwin():
-            from meldapp import app
+            from meld.meldapp import app
 
             def make_app_action(name):
                 def app_action(*args):
@@ -231,15 +231,14 @@ class MeldWindow(gnomeglade.Component):
         self.widget.connect("drag_data_received",
                             self.on_widget_drag_data_received)
 
+        self.window_state = SavedWindowState()
+        self.window_state.bind(self.widget)
+
         self.should_close = False
         self.idle_hooked = 0
         self.scheduler = task.LifoScheduler()
         self.scheduler.connect("runnable", self.on_scheduler_runnable)
-        window_size = settings.get_value('window-size')
-        self.widget.set_default_size(window_size[0], window_size[1])
-        window_state = settings.get_string('window-state')
-        if window_state == 'maximized':
-            self.widget.maximize()
+
         self.ui.ensure_update()
         self.diff_handler = None
         self.undo_handlers = tuple()
@@ -306,7 +305,7 @@ class MeldWindow(gnomeglade.Component):
 
     def on_idle(self):
         ret = self.scheduler.iteration()
-        if ret and isinstance(ret, string_types):
+        if ret and isinstance(ret, str):
             self.spinner.set_tooltip_text(ret)
 
         pending = self.scheduler.tasks_pending()
@@ -436,17 +435,6 @@ class MeldWindow(gnomeglade.Component):
         self.actiongroup.get_action("PrevChange").set_sensitive(have_prev)
         self.actiongroup.get_action("NextChange").set_sensitive(have_next)
 
-    def on_configure_event(self, window, event):
-        state = event.window.get_state()
-        nosave = Gdk.WindowState.FULLSCREEN | Gdk.WindowState.MAXIMIZED
-        if not (state & nosave):
-            variant = GLib.Variant('(ii)', (event.width, event.height))
-            settings.set_value('window-size', variant)
-
-        maximised = state & Gdk.WindowState.MAXIMIZED
-        window_state = 'maximized' if maximised else 'normal'
-        settings.set_string('window-state', window_state)
-
     def on_menu_file_new_activate(self, menuitem):
         self.append_new_comparison()
 
@@ -549,6 +537,9 @@ class MeldWindow(gnomeglade.Component):
         if not self.has_pages():
             self.on_switch_page(self.notebook, page, -1)
             self._update_page_action_sensitivity()
+            # Synchronise UIManager state; this shouldn't be necessary,
+            # but upstream aren't touching UIManager bugs.
+            self.ui.ensure_update()
             if self.should_close:
                 cancelled = self.widget.emit(
                     'delete-event', Gdk.Event.new(Gdk.EventType.DELETE))

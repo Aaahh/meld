@@ -23,8 +23,7 @@ from gi.repository import GObject
 from gi.repository import Gtk
 from gi.repository import GtkSource
 
-import meldbuffer
-
+from meld.meldbuffer import MeldBuffer
 from meld.misc import colour_lookup_with_fallback, get_common_theme
 from meld.settings import bind_settings, meldsettings, settings
 
@@ -48,6 +47,7 @@ def get_custom_encoding_candidates():
         # get_default_candidates() is only available in GtkSourceView 3.18
         # and we'd rather use their defaults than our old detect list.
         pass
+    return custom_candidates
 
 
 class LanguageManager(object):
@@ -144,7 +144,7 @@ class MeldSourceView(GtkSource.View):
         self.syncpoints = []
         self._show_line_numbers = None
 
-        buf = meldbuffer.MeldBuffer()
+        buf = MeldBuffer()
         buf.create_tag("inline")
         buf.create_tag("dimmed")
         self.set_buffer(buf)
