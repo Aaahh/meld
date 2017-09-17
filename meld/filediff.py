@@ -1,5 +1,3 @@
-# coding=UTF-8
-
 # Copyright (C) 2002-2006 Stephen Kennedy <stevek@gnome.org>
 # Copyright (C) 2009-2015 Kai Willadsen <kai.willadsen@gmail.com>
 #
@@ -18,12 +16,8 @@
 
 import copy
 import functools
+import math
 import os
-import time
-
-from multiprocessing import Pool
-from multiprocessing.pool import ThreadPool
-
 
 from gi.repository import GLib
 from gi.repository import GObject
@@ -33,22 +27,21 @@ from gi.repository import Gtk
 from gi.repository import GtkSource
 
 from meld.conf import _
-from . import diffutil
-from . import matchers
 from . import meldbuffer
 from . import melddoc
-from . import merge
 from . import misc
-from . import patchdialog
 from . import recent
 from . import undo
-from .ui import findbar
 from .ui import gnomeglade
 
 from meld.const import MODE_REPLACE, MODE_DELETE, MODE_INSERT, NEWLINES
+from meld.matchers.diffutil import Differ, merged_chunk_order
+from meld.matchers.helpers import CachedSequenceMatcher
+from meld.matchers.merge import Merger
+from meld.patchdialog import PatchDialog
 from meld.settings import bind_settings, meldsettings
-from .util.compat import text_type
 from meld.sourceview import LanguageManager, get_custom_encoding_candidates
+from meld.ui.findbar import FindBar
 
 
 def with_focused_pane(function):
@@ -61,49 +54,31 @@ def with_focused_pane(function):
     return wrap_function
 
 
-class CachedSequenceMatcher(object):
-    """Simple class for caching diff results, with LRU-based eviction
+def with_scroll_lock(lock_attr):
+    """Decorator for locking a callback based on an instance attribute
 
-    Results from the SequenceMatcher are cached and timestamped, and
-    subsequently evicted based on least-recent generation/usage. The LRU-based
-    eviction is overly simplistic, but is okay for our usage pattern.
+    This is used when scrolling panes. Since a scroll event in one pane
+    causes us to set the scroll position in other panes, we need to
+    stop these other panes re-scrolling the initial one.
+
+    Unlike a threading-style lock, this decorator discards any calls
+    that occur while the lock is held, rather than queuing them.
+
+    :param lock_attr: The instance attribute used to lock access
     """
+    def wrap(function):
+        @functools.wraps(function)
+        def wrap_function(locked, *args, **kwargs):
+            if getattr(locked, lock_attr, False) or locked._scroll_lock:
+                return
 
-    process_pool = None
-
-    def __init__(self):
-        if self.process_pool is None:
-            if os.name == "nt":
-                CachedSequenceMatcher.process_pool = ThreadPool(None)
-            else:
-                CachedSequenceMatcher.process_pool = Pool(
-                    None, matchers.init_worker, maxtasksperchild=1)
-        self.cache = {}
-
-    def match(self, text1, textn, cb):
-        try:
-            self.cache[(text1, textn)][1] = time.time()
-            opcodes = self.cache[(text1, textn)][0]
-            GLib.idle_add(lambda: cb(opcodes))
-        except KeyError:
-            def inline_cb(opcodes):
-                self.cache[(text1, textn)] = [opcodes, time.time()]
-                GLib.idle_add(lambda: cb(opcodes))
-            self.process_pool.apply_async(matchers.matcher_worker,
-                                          (text1, textn),
-                                          callback=inline_cb)
-
-    def clean(self, size_hint):
-        """Clean the cache if necessary
-
-        @param size_hint: the recommended minimum number of cache entries
-        """
-        if len(self.cache) < size_hint * 3:
-            return
-        items = self.cache.items()
-        items.sort(key=lambda it: it[1][1])
-        for item in items[:-size_hint * 2]:
-            del self.cache[item[0]]
+            try:
+                setattr(locked, lock_attr, True)
+                return function(locked, *args, **kwargs)
+            finally:
+                setattr(locked, lock_attr, False)
+        return wrap_function
+    return wrap
 
 
 MASK_SHIFT, MASK_CTRL = 1, 2
@@ -135,7 +110,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         default=False,
     )
 
-    differ = diffutil.Differ
+    differ = Differ
 
     keylookup = {
         Gdk.KEY_Shift_L: MASK_SHIFT,
@@ -179,7 +154,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         self.warned_bad_comparison = False
         self._keymask = 0
         self.meta = {}
-        self.deleted_lines_pending = -1
+        self.lines_removed = 0
         self.textview_overwrite = 0
         self.focus_pane = None
         self.textview_overwrite_handlers = [ t.connect("toggle-overwrite", self.on_textview_toggle_overwrite) for t in self.textview ]
@@ -197,9 +172,6 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         for (i, w) in enumerate(self.scrolledwindow):
             w.get_vadjustment().connect("value-changed", self._sync_vscroll, i)
             w.get_hadjustment().connect("value-changed", self._sync_hscroll)
-            # Revert overlay scrolling that messes with widget interactivity
-            if hasattr(w, 'set_overlay_scrolling'):
-                w.set_overlay_scrolling(False)
         self._connect_buffer_handlers()
         self._sync_vscroll_lock = False
         self._sync_hscroll_lock = False
@@ -208,7 +180,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         self.force_highlight = False
         self.syncpoints = []
         self.in_nested_textview_gutter_expose = False
-        self._cached_match = CachedSequenceMatcher()
+        self._cached_match = CachedSequenceMatcher(self.scheduler)
 
         for buf in self.textbuffer:
             buf.undo_sequence = self.undosequence
@@ -220,7 +192,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         self.actiongroup = self.FilediffActions
         self.actiongroup.set_translation_domain("meld")
 
-        self.findbar = findbar.FindBar(self.grid)
+        self.findbar = FindBar(self.grid)
         self.grid.attach(self.findbar.widget, 1, 2, 5, 1)
 
         self.set_num_panes(num_panes)
@@ -257,6 +229,9 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
                     window = Gtk.TextWindowType.LEFT
                 views = [self.textview[pane], self.textview[pane + 1]]
                 renderer = GutterRendererChunkAction(pane, pane + 1, views, self, self.linediffer)
+                renderer.set_alignment_mode(GtkSource.GutterRendererAlignmentMode.FIRST)
+                renderer.set_padding(3, 0)
+                renderer.set_alignment(0.5, 0.5)
                 gutter = t.get_gutter(window)
                 gutter.insert(renderer, 10)
             if pane in (1, 2):
@@ -265,6 +240,9 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
                     window = Gtk.TextWindowType.RIGHT
                 views = [self.textview[pane], self.textview[pane - 1]]
                 renderer = GutterRendererChunkAction(pane, pane - 1, views, self, self.linediffer)
+                renderer.set_alignment_mode(GtkSource.GutterRendererAlignmentMode.FIRST)
+                renderer.set_padding(3, 0)
+                renderer.set_alignment(0.5, 0.5)
                 gutter = t.get_gutter(window)
                 gutter.insert(renderer, -40)
 
@@ -366,7 +344,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         self.cursor.pane, self.cursor.pos = pane, pos
 
         cursor_it = buf.get_iter_at_offset(pos)
-        offset = cursor_it.get_line_offset()
+        offset = self.textview[pane].get_visual_column(cursor_it)
         line = cursor_it.get_line()
 
         insert_overwrite = self._insert_overwrite_text[self.textview_overwrite]
@@ -473,6 +451,16 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         self.actiongroup.get_action("PrevConflict").set_sensitive(have_prev)
         self.actiongroup.get_action("NextConflict").set_sensitive(have_next)
 
+    def scroll_to_chunk_index(self, chunk_index, tolerance):
+        """Scrolls chunks with the given index on screen in all panes"""
+        starts = self.linediffer.get_chunk_starts(chunk_index)
+        for pane, start in enumerate(starts):
+            if start is None:
+                continue
+            buf = self.textbuffer[pane]
+            it = buf.get_iter_at_line(start)
+            self.textview[pane].scroll_to_iter(it, tolerance, True, 0.5, 0.5)
+
     def go_to_chunk(self, target, pane=None, centered=False):
         if target is None:
             return
@@ -491,7 +479,10 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         if self.cursor.line != chunk[1]:
             buf.place_cursor(buf.get_iter_at_line(chunk[1]))
 
+        # Scroll all panes to the given chunk, and then ensure that the newly
+        # placed cursor is definitely on-screen.
         tolerance = 0.0 if centered else 0.2
+        self.scroll_to_chunk_index(target, tolerance)
         self.textview[pane].scroll_to_mark(
             buf.get_insert(), tolerance, True, 0.5, 0.5)
 
@@ -565,7 +556,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
             src, dst, self.get_action_chunk(src, dst), copy_up=False)
 
     def pull_all_non_conflicting_changes(self, src, dst):
-        merger = merge.Merger()
+        merger = Merger()
         merger.differ = self.linediffer
         merger.texts = self.buffer_texts
         for mergedfile in merger.merge_2_files(src, dst):
@@ -590,7 +581,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
 
     def merge_all_non_conflicting_changes(self, *args):
         dst = 1
-        merger = merge.Merger()
+        merger = Merger()
         merger.differ = self.linediffer
         merger.texts = self.buffer_texts
         for mergedfile in merger.merge_3_files(False):
@@ -605,7 +596,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         self.scheduler.add_task(resync)
 
     @with_focused_pane
-    def delete_change(self, pane):
+    def delete_change(self, pane, *args):
         chunk = self.linediffer.get_chunk(self.cursor.chunk, pane)
         assert(self.cursor.chunk is not None)
         assert(chunk is not None)
@@ -738,9 +729,9 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         self._set_merge_action_sensitivity()
         self._set_external_action_sensitivity()
 
-    def _after_text_modified(self, buffer, startline, sizechange):
+    def _after_text_modified(self, buf, startline, sizechange):
         if self.num_panes > 1:
-            pane = self.textbuffer.index(buffer)
+            pane = self.textbuffer.index(buf)
             if not self.linediffer.syncpoints:
                 self.linediffer.change_sequence(pane, startline, sizechange,
                                                 self.buffer_filtered)
@@ -755,19 +746,16 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         dimmed_tag = buf.get_tag_table().lookup("dimmed")
         buf.remove_tag(dimmed_tag, txt_start_iter, txt_end_iter)
 
-        def cutter(txt, start, end):
-            assert txt[start:end].count("\n") == 0
-            txt = txt[:start] + txt[end:]
+        def highlighter(start, end):
             start_iter = txt_start_iter.copy()
             start_iter.forward_chars(start)
             end_iter = txt_start_iter.copy()
             end_iter.forward_chars(end)
             buf.apply_tag(dimmed_tag, start_iter, end_iter)
-            return txt
 
         try:
             regexes = [f.filter for f in self.text_filters if f.active]
-            txt = misc.apply_text_filters(txt, regexes, cutter)
+            txt = misc.apply_text_filters(txt, regexes, apply_fn=highlighter)
         except AssertionError:
             if not self.warned_bad_comparison:
                 misc.error_dialog(
@@ -788,12 +776,10 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         lines_added = it.get_line() - starting_at
         self._after_text_modified(buf, starting_at, lines_added)
 
-    def after_text_delete_range(self, buffer, it0, it1):
+    def after_text_delete_range(self, buf, it0, it1):
         starting_at = it0.get_line()
-        assert self.deleted_lines_pending != -1
-        self._after_text_modified(buffer, starting_at, -self.deleted_lines_pending)
-        self.deleted_lines_pending = -1
-
+        self._after_text_modified(buf, starting_at, -self.lines_removed)
+        self.lines_removed = 0
 
     def check_save_modified(self):
         response = Gtk.ResponseType.OK
@@ -844,7 +830,10 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
                 if resolve_response == Gtk.ResponseType.OK:
                     bufdata = self.textbuffer[1].data
                     conflict_file = bufdata.savefile or bufdata.filename
-                    parent.command('resolve', [conflict_file])
+                    # It's possible that here we're in a quit callback,
+                    # so we can't schedule the resolve action to an
+                    # idle loop; it might never happen.
+                    parent.command('resolve', [conflict_file], sync=True)
         elif response == Gtk.ResponseType.CANCEL:
             self.state = melddoc.STATE_NORMAL
 
@@ -880,15 +869,13 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         self._scroll_to_actions(actions)
 
     def on_text_insert_text(self, buf, it, text, textlen):
-        text = text_type(text, 'utf8')
         self.undosequence.add_action(
             meldbuffer.BufferInsertionAction(buf, it.get_offset(), text))
         buf.create_mark("insertion-start", it, True)
 
     def on_text_delete_range(self, buf, it0, it1):
-        text = text_type(buf.get_text(it0, it1, False), 'utf8')
-        assert self.deleted_lines_pending == -1
-        self.deleted_lines_pending = it1.get_line() - it0.get_line()
+        text = buf.get_text(it0, it1, False)
+        self.lines_removed = it1.get_line() - it0.get_line()
         self.undosequence.add_action(
             meldbuffer.BufferDeletionAction(buf, it0.get_offset(), text))
 
@@ -927,7 +914,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         buf = self.textbuffer[pane]
         sel = buf.get_selection_bounds()
         if sel:
-            return text_type(buf.get_text(sel[0], sel[1], False), 'utf8')
+            return buf.get_text(sel[0], sel[1], False)
 
     def on_find_activate(self, *args):
         selected_text = self.get_selected_text()
@@ -1019,7 +1006,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         if label:
             self.label_text = label
         else:
-            self.label_text = (" — ").decode('utf8').join(shortnames)
+            self.label_text = " — ".join(shortnames)
         self.tooltip_text = self.label_text
         self.label_changed()
 
@@ -1047,10 +1034,15 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
             self.fileentry[pane].set_file(gfile)
             self.msgarea_mgr[pane].clear()
 
-            self.textbuffer[pane].data.reset(gfile)
+            buf = self.textbuffer[pane]
+            buf.data.reset(gfile)
 
-            loader = GtkSource.FileLoader.new(
-                self.textbuffer[pane], self.textbuffer[pane].data.sourcefile)
+            if buf.data.is_special:
+                loader = GtkSource.FileLoader.new_from_stream(
+                    buf, buf.data.sourcefile, buf.data.gfile.read())
+            else:
+                loader = GtkSource.FileLoader.new(buf, buf.data.sourcefile)
+
             if custom_candidates:
                 loader.set_candidate_encodings(custom_candidates)
             loader.load_async(
@@ -1079,7 +1071,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
                 pass
 
             filename = GLib.markup_escape_text(
-                gfile.get_parse_name()).decode('utf-8')
+                gfile.get_parse_name())
             primary = _(
                 u"There was a problem opening the file “%s”." % filename)
             self.msgarea_mgr[pane].add_dismissable_msg(
@@ -1117,24 +1109,21 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
             yield 1
 
         if not refresh:
-            chunk, prev, next_ = self.linediffer.locate_chunk(1, 0)
-            self.cursor.next = chunk
-            if self.cursor.next is None:
-                self.cursor.next = next_
             for buf in self.textbuffer:
                 buf.place_cursor(buf.get_start_iter())
 
-            if self.cursor.next is not None:
-                self.scheduler.add_task(
-                    lambda: self.go_to_chunk(self.cursor.next, centered=True),
-                    True)
-            else:
-                buf = self.textbuffer[1 if self.num_panes > 1 else 0]
-                self.on_cursor_position_changed(buf, None, True)
+            chunk, prev, next_ = self.linediffer.locate_chunk(1, 0)
+            target_chunk = chunk if chunk is not None else next_
+            self.scheduler.add_task(
+                lambda: self.go_to_chunk(target_chunk, centered=True), True)
 
         self.queue_draw()
         self._connect_buffer_handlers()
         self._set_merge_action_sensitivity()
+
+        # Changing textview sensitivity destroys focus; we reestablish it here
+        if self.cursor.pane is not None:
+            self.textview[self.cursor.pane].grab_focus()
 
         langs = [LanguageManager.get_language_from_file(buf.data.gfile)
                  for buf in self.textbuffer[:self.num_panes]]
@@ -1173,7 +1162,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
             # Notification for unknown buffer
             return
         gfile = Gio.File.new_for_path(data.filename)
-        display_name = gfile.get_parse_name().decode('utf-8')
+        display_name = gfile.get_parse_name()
         primary = _("File %s has changed on disk") % display_name
         secondary = _("Do you want to reload the file?")
         self.msgarea_mgr[pane].add_action_msg(
@@ -1213,8 +1202,10 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
 
         # We need to clear removed and modified chunks, and need to
         # re-highlight added and modified chunks.
-        need_clearing = sorted(list(removed_chunks))
-        need_highlighting = sorted(list(added_chunks) + [modified_chunks])
+        need_clearing = sorted(
+            list(removed_chunks), key=merged_chunk_order)
+        need_highlighting = sorted(
+            list(added_chunks) + [modified_chunks], key=merged_chunk_order)
 
         alltags = [b.get_tag_table().lookup("inline") for b in self.textbuffer]
 
@@ -1235,12 +1226,12 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
 
         for chunk in need_highlighting:
             clear = chunk == modified_chunks
-            for i, c in enumerate(chunk):
+            for merge_cache_index, c in enumerate(chunk):
                 if not c or c[0] != "replace":
                     continue
-                to_idx = 2 if i == 1 else 0
-                bufs = self.textbuffer[1], self.textbuffer[to_idx]
-                tags = alltags[1], alltags[to_idx]
+                to_pane = 2 if merge_cache_index == 1 else 0
+                bufs = self.textbuffer[1], self.textbuffer[to_pane]
+                tags = alltags[1], alltags[to_pane]
 
                 starts = [b.get_iter_at_line_or_eof(l) for b, l in
                           zip(bufs, (c[1], c[3]))]
@@ -1250,9 +1241,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
                 # We don't use self.buffer_texts here, as removing line
                 # breaks messes with inline highlighting in CRLF cases
                 text1 = bufs[0].get_text(starts[0], ends[0], False)
-                text1 = text_type(text1, 'utf8')
                 textn = bufs[1].get_text(starts[1], ends[1], False)
-                textn = text_type(textn, 'utf8')
 
                 # Bail on long sequences, rather than try a slow comparison
                 inline_limit = 10000
@@ -1263,20 +1252,24 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
                     self._prompt_long_highlighting()
                     continue
 
-                def apply_highlight(bufs, tags, start_marks, end_marks, texts, matches):
+                def apply_highlight(
+                        bufs, tags, start_marks, end_marks, texts, to_pane,
+                        chunk, matches):
                     starts = [bufs[0].get_iter_at_mark(start_marks[0]),
                               bufs[1].get_iter_at_mark(start_marks[1])]
                     ends = [bufs[0].get_iter_at_mark(end_marks[0]),
                             bufs[1].get_iter_at_mark(end_marks[1])]
-                    text1 = bufs[0].get_text(starts[0], ends[0], False)
-                    text1 = text_type(text1, 'utf8')
-                    textn = bufs[1].get_text(starts[1], ends[1], False)
-                    textn = text_type(textn, 'utf8')
 
                     bufs[0].delete_mark(start_marks[0])
                     bufs[0].delete_mark(end_marks[0])
                     bufs[1].delete_mark(start_marks[1])
                     bufs[1].delete_mark(end_marks[1])
+
+                    if not self.linediffer.has_chunk(to_pane, chunk):
+                        return
+
+                    text1 = bufs[0].get_text(starts[0], ends[0], False)
+                    textn = bufs[1].get_text(starts[1], ends[1], False)
 
                     if texts != (text1, textn):
                         return
@@ -1316,8 +1309,9 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
                           bufs[1].create_mark(None, starts[1], True)]
                 ends = [bufs[0].create_mark(None, ends[0], True),
                         bufs[1].create_mark(None, ends[1], True)]
-                match_cb = functools.partial(apply_highlight, bufs, tags,
-                                             starts, ends, (text1, textn))
+                match_cb = functools.partial(
+                    apply_highlight, bufs, tags, starts, ends, (text1, textn),
+                    to_pane, c)
                 self._cached_match.match(text1, textn, match_cb)
 
         self._cached_match.clean(self.linediffer.diff_count())
@@ -1471,7 +1465,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         if not force_overwrite and not bufdata.current_on_disk():
             primary = (
                 _("File %s has changed on disk since it was opened") %
-                bufdata.gfile.get_parse_name().decode('utf-8'))
+                bufdata.gfile.get_parse_name())
             secondary = _("If you save it, any external changes will be lost.")
             msgarea = self.msgarea_mgr[pane].new_from_text_and_icon(
                 'dialog-warning-symbolic', primary, secondary)
@@ -1488,10 +1482,14 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
             return False
 
         start, end = buf.get_bounds()
-        text = text_type(buf.get_text(start, end, False), 'utf8')
+        text = buf.get_text(start, end, False)
 
         source_encoding = bufdata.sourcefile.get_encoding()
-        while isinstance(text, unicode):
+        if not source_encoding:
+            # no encoding for new blank comparison
+            source_encoding = GtkSource.Encoding.get_utf8()
+
+        while isinstance(text, str):
             try:
                 encoding = source_encoding.get_charset()
                 text = text.encode(encoding)
@@ -1521,6 +1519,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         # handling the GtkSource.FileSaverError.EXTERNALLY_MODIFIED error
         if force_overwrite:
             saver.set_flags(GtkSource.FileSaverFlags.IGNORE_MODIFICATION_TIME)
+        bufdata.disconnect_monitor()
         saver.save_async(
             GLib.PRIORITY_HIGH,
             callback=self.file_saved_cb,
@@ -1531,6 +1530,8 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
     def file_saved_cb(self, saver, result, user_data):
         gfile = saver.get_location()
         pane = user_data[0]
+        buf = saver.get_buffer()
+        buf.data.connect_monitor()
 
         try:
             saver.save_finish(result)
@@ -1538,7 +1539,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
             # TODO: Handle recoverable error cases, like external modifications
             # or invalid buffer characters.
             filename = GLib.markup_escape_text(
-                gfile.get_parse_name()).decode('utf-8')
+                gfile.get_parse_name())
             misc.error_dialog(
                 primary=_("Could not save file %s.") % filename,
                 secondary=_("Couldn't save file due to:\n%s") % (
@@ -1547,7 +1548,6 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
             self.state = melddoc.STATE_SAVING_ERROR
             return
 
-        buf = saver.get_buffer()
         self.emit('file-changed', gfile.get_path())
         self.undosequence.checkpoint(buf)
         buf.data.update_mtime()
@@ -1561,7 +1561,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
             self.state = melddoc.STATE_NORMAL
 
     def make_patch(self, *extra):
-        dialog = patchdialog.PatchDialog(self)
+        dialog = PatchDialog(self)
         dialog.run()
 
     def update_buffer_writable(self, buf):
@@ -1603,7 +1603,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         entries = self.fileentry[:self.num_panes]
         if self.check_save_modified() != Gtk.ResponseType.CANCEL:
             files = [e.get_file() for e in entries]
-            paths = [f.get_path() for f in files]
+            paths = [f.get_path() if f is not None else f for f in files]
             self.set_files(paths)
         else:
             idx = entries.index(entry)
@@ -1657,68 +1657,84 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         buf = self.textbuffer[index]
         self.set_buffer_editable(buf, not button.get_active())
 
+    @with_scroll_lock('_sync_hscroll_lock')
     def _sync_hscroll(self, adjustment):
-        if self._sync_hscroll_lock or self._scroll_lock:
-            return
-
-        self._sync_hscroll_lock = True
         val = adjustment.get_value()
         for sw in self.scrolledwindow[:self.num_panes]:
             adj = sw.get_hadjustment()
             if adj is not adjustment:
                 adj.set_value(val)
-        self._sync_hscroll_lock = False
 
+    @with_scroll_lock('_sync_vscroll_lock')
     def _sync_vscroll(self, adjustment, master):
-        # only allow one scrollbar to be here at a time
-        if self._sync_vscroll_lock:
-            return
+        syncpoint = misc.calc_syncpoint(adjustment)
 
-        if not self._scroll_lock and (self.keymask & MASK_SHIFT) == 0:
-            self._sync_vscroll_lock = True
-            syncpoint = 0.5
+        # Middle of the screen, in buffer coords
+        middle_y = (
+            adjustment.get_value() + adjustment.get_page_size() * syncpoint)
 
-            # the line to search for in the 'master' text
-            master_y = (adjustment.get_value() + adjustment.get_page_size() *
-                        syncpoint)
-            it = self.textview[master].get_line_at_y(int(master_y))[0]
-            line_y, height = self.textview[master].get_line_yrange(it)
-            line = it.get_line() + ((master_y-line_y)/height)
+        # Find the target line. This is a float because, especially for
+        # wrapped lines, the sync point may be half way through a line.
+        # Not doing this calculation makes scrolling jerky.
+        middle_iter, _ = self.textview[master].get_line_at_y(int(middle_y))
+        line_y, height = self.textview[master].get_line_yrange(middle_iter)
+        height = height or 1
+        target_line = middle_iter.get_line() + ((middle_y - line_y) / height)
 
-            # scrollbar influence 0->1->2 or 0<-1->2 or 0<-1<-2
-            scrollbar_influence = ((1, 2), (0, 2), (1, 0))
+        # In the case of two pane scrolling, it's clear how to bind
+        # scrollbars: if the user moves the left pane, we move the
+        # right pane, and vice versa.
+        #
+        # For three pane scrolling, we want panes to be tied, but need
+        # an influence mapping. In Meld, all influence flows through
+        # the middle pane, e.g., the user moves the left pane, that
+        # moves the middle pane, and the middle pane moves the right
+        # pane. If the user moves the middle pane, then the left and
+        # right panes are moved directly.
 
-            for i in scrollbar_influence[master][:self.num_panes - 1]:
-                adj = self.scrolledwindow[i].get_vadjustment()
-                mbegin, mend = 0, self.textbuffer[master].get_line_count()
-                obegin, oend = 0, self.textbuffer[i].get_line_count()
-                # look for the chunk containing 'line'
-                for c in self.linediffer.pair_changes(master, i):
-                    if c[1] >= line:
-                        mend = c[1]
-                        oend = c[3]
-                        break
-                    elif c[2] >= line:
-                        mbegin, mend = c[1], c[2]
-                        obegin, oend = c[3], c[4]
-                        break
-                    else:
-                        mbegin = c[2]
-                        obegin = c[4]
-                fraction = (line - mbegin) / ((mend - mbegin) or 1)
-                other_line = (obegin + fraction * (oend - obegin))
-                it = self.textbuffer[i].get_iter_at_line(int(other_line))
-                val, height = self.textview[i].get_line_yrange(it)
-                val -= (adj.get_page_size()) * syncpoint
-                val += (other_line-int(other_line)) * height
-                val = min(max(val, adj.get_lower()),
-                          adj.get_upper() - adj.get_page_size())
-                adj.set_value(val)
+        scrollbar_influence = ((1, 2), (0, 2), (1, 0))
 
-                # If we just changed the central bar, make it the master
-                if i == 1:
-                    master, line = 1, other_line
-            self._sync_vscroll_lock = False
+        for i in scrollbar_influence[master][:self.num_panes - 1]:
+            adj = self.scrolledwindow[i].get_vadjustment()
+
+            # Find the chunk, or more commonly the space between
+            # chunks, that contains the target line.
+            #
+            # This is a naive linear search that remains because it's
+            # never shown up in profiles. We can't reuse our line cache
+            # here; it doesn't have the necessary information in three-
+            # way diffs.
+            mbegin, mend = 0, self.textbuffer[master].get_line_count()
+            obegin, oend = 0, self.textbuffer[i].get_line_count()
+            for chunk in self.linediffer.pair_changes(master, i):
+                if chunk.start_a >= target_line:
+                    mend = chunk.start_a
+                    oend = chunk.start_b
+                    break
+                elif chunk.end_a >= target_line:
+                    mbegin, mend = chunk.start_a, chunk.end_a
+                    obegin, oend = chunk.start_b, chunk.end_b
+                    break
+                else:
+                    mbegin = chunk.end_a
+                    obegin = chunk.end_b
+
+            fraction = (target_line - mbegin) / ((mend - mbegin) or 1)
+            other_line = obegin + fraction * (oend - obegin)
+            it = self.textbuffer[i].get_iter_at_line(int(other_line))
+            val, height = self.textview[i].get_line_yrange(it)
+            # Special case line-height adjustment for EOF
+            line_factor = 1.0 if it.is_end() else other_line - int(other_line)
+            val += line_factor * height
+            val -= adj.get_page_size() * syncpoint
+            val = min(max(val, adj.get_lower()),
+                      adj.get_upper() - adj.get_page_size())
+            val = math.floor(val)
+            adj.set_value(val)
+
+            # If we just changed the central bar, make it the master
+            if i == 1:
+                master, target_line = 1, other_line
 
         for lm in self.linkmap:
             lm.queue_draw()
@@ -1791,7 +1807,7 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         b0, b1 = self.textbuffer[src], self.textbuffer[dst]
         start = b0.get_iter_at_line_or_eof(chunk[1])
         end = b0.get_iter_at_line_or_eof(chunk[2])
-        t0 = text_type(b0.get_text(start, end, False), 'utf8')
+        t0 = b0.get_text(start, end, False)
 
         if copy_up:
             if chunk[2] >= b0.get_line_count() and \
@@ -1818,12 +1834,13 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         src_end = b0.get_iter_at_line_or_eof(chunk[2])
         dst_start = b1.get_iter_at_line_or_eof(chunk[3])
         dst_end = b1.get_iter_at_line_or_eof(chunk[4])
-        t0 = text_type(b0.get_text(src_start, src_end, False), 'utf8')
+        t0 = b0.get_text(src_start, src_end, False)
         mark0 = b1.create_mark(None, dst_start, True)
-        self.textbuffer[dst].begin_user_action()
+        b1.begin_user_action()
         b1.delete(dst_start, dst_end)
         new_end = b1.insert_at_line(chunk[3], t0)
-        self.textbuffer[dst].end_user_action()
+        b1.place_cursor(b1.get_iter_at_line(chunk[3]))
+        b1.end_user_action()
         mark1 = b1.create_mark(None, new_end, True)
         if chunk[1] == chunk[2]:
             # TODO: Need a more specific colour here; conflict is wrong
@@ -1839,7 +1856,9 @@ class FileDiff(melddoc.MeldDoc, gnomeglade.Component):
         b0 = self.textbuffer[src]
         it = b0.get_iter_at_line_or_eof(chunk[1])
         if chunk[2] >= b0.get_line_count():
-            it.backward_char()
+            # If this is the end of the buffer, we need to remove the
+            # previous newline, because the current line has none.
+            it.backward_cursor_position()
         b0.delete(it, b0.get_iter_at_line_or_eof(chunk[2]))
         mark0 = b0.create_mark(None, it, True)
         mark1 = b0.create_mark(None, it, True)

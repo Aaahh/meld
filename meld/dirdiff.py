@@ -21,7 +21,6 @@ import copy
 import datetime
 import errno
 import functools
-import locale
 import os
 import re
 import shutil
@@ -95,7 +94,7 @@ def remove_blank_lines(text):
     lines = text.splitlines(True)
     blanks = set([i for i, l in enumerate(splits) if not l])
     lines = [l for i, l in enumerate(lines) if i not in blanks]
-    return ''.join(lines)
+    return b''.join(lines)
 
 
 def _files_same(files, regexes, comparison_args):
@@ -158,7 +157,7 @@ def _files_same(files, regexes, comparison_args):
 
             # Rough test to see whether files are binary. If files are guessed
             # to be binary, we don't examine contents for speed and space.
-            if any(["\0" in d for d in data]):
+            if any(b"\0" in d for d in data):
                 need_contents = False
 
             while True:
@@ -190,10 +189,10 @@ def _files_same(files, regexes, comparison_args):
         result = Same
 
     if result == Different and need_contents:
-        contents = ["".join(c) for c in contents]
+        contents = [b"".join(c) for c in contents]
         # For probable text files, discard newline differences to match
         # file comparisons.
-        contents = ["\n".join(c.splitlines()) for c in contents]
+        contents = [b"\n".join(c.splitlines()) for c in contents]
 
         contents = [misc.apply_text_filters(c, regexes) for c in contents]
 
@@ -361,6 +360,7 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
             handler_id = treeview.connect("focus-out-event", self.on_treeview_focus_out_event)
             self.focus_out_events.append(handler_id)
             treeview.set_search_equal_func(self.model.treeview_search_cb, None)
+        self.force_cursor_recalculate = False
         self.current_path, self.prev_path, self.next_path = None, None, None
         self.on_treeview_focus_out_event(None, None)
         self.focus_pane = None
@@ -421,9 +421,6 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
                 "value-changed", self._sync_vscroll)
             self.scrolledwindow[i].get_hadjustment().connect(
                 "value-changed", self._sync_hscroll)
-            # Revert overlay scrolling that messes with widget interactivity
-            if hasattr(self.scrolledwindow[i], 'set_overlay_scrolling'):
-                self.scrolledwindow[i].set_overlay_scrolling(False)
         self.linediffs = [[], []]
 
         self.update_treeview_columns(settings, 'folder-columns')
@@ -579,13 +576,13 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
 
     def _sync_vscroll(self, adjustment):
         adjs = [sw.get_vadjustment() for sw in self.scrolledwindow]
-        self._do_to_others(adjustment, adjs, "set_value",
-                           (adjustment.get_value(), ))
+        self._do_to_others(
+            adjustment, adjs, "set_value", (int(adjustment.get_value()),))
 
     def _sync_hscroll(self, adjustment):
         adjs = [sw.get_hadjustment() for sw in self.scrolledwindow]
-        self._do_to_others(adjustment, adjs, "set_value",
-                           (adjustment.get_value(), ))
+        self._do_to_others(
+            adjustment, adjs, "set_value", (int(adjustment.get_value()),))
 
     def _get_focused_pane(self):
         for i, treeview in enumerate(self.treeview):
@@ -624,7 +621,7 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
         # the time we get this far. This is a fallback, and may be wrong!
         locations = list(locations)
         for i, l in enumerate(locations):
-            if not isinstance(l, unicode):
+            if not isinstance(l, str):
                 locations[i] = l.decode(sys.getfilesystemencoding())
         locations = [os.path.abspath(l) if l else '' for l in locations]
         self.current_path = None
@@ -719,7 +716,7 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
 
                 for e in entries:
                     try:
-                        if not isinstance(e, unicode):
+                        if not isinstance(e, str):
                             e = e.decode('utf8')
                     except UnicodeDecodeError:
                         approximate_name = e.decode('utf8', 'replace')
@@ -798,7 +795,6 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
                         # no siblings. If we're here, we have an empty tree.
                         if parent is None:
                             self.model.add_empty(it)
-                            expanded.add(tuple_tree_path(rootpath))
                             break
 
                         # Remove the current row, and then revalidate all
@@ -826,9 +822,9 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
             self.treeview[0].expand_to_path(Gtk.TreePath(path))
         yield _("[%s] Done") % self.label_text
 
-        self.scheduler.add_task(self.on_treeview_cursor_changed)
         self._scan_in_progress -= 1
-        self.treeview[0].get_selection().select_path(Gtk.TreePath.new_first())
+        self.force_cursor_recalculate = True
+        self.treeview[0].set_cursor(Gtk.TreePath.new_first())
         self._update_diffmaps()
 
     def _show_identical_status(self):
@@ -1081,9 +1077,11 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
             self.current_path = cursor_path
             return
 
-        # If invoked directly rather than through a callback, we always check
-        if not args:
+        if self.force_cursor_recalculate:
+            # We force cursor recalculation on initial load, and when
+            # we handle model change events.
             skip = False
+            self.force_cursor_recalculate = False
         else:
             try:
                 old_cursor = self.model.get_iter(self.current_path)
@@ -1267,7 +1265,7 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
         """
         assert len(roots) == self.model.ntree
         ret = []
-        regexes = [f.filter for f in self.text_filters if f.active]
+        regexes = [f.byte_filter for f in self.text_filters if f.active]
         for files in fileslist:
             curfiles = [ os.path.join( r, f ) for r,f in zip(roots,files) ]
             is_present = [ os.path.exists( f ) for f in curfiles ]
@@ -1291,7 +1289,7 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
         """Update the state of the item at 'it'
         """
         files = self.model.value_paths(it)
-        regexes = [f.filter for f in self.text_filters if f.active]
+        regexes = [f.byte_filter for f in self.text_filters if f.active]
 
         def stat(f):
             try:
@@ -1302,11 +1300,17 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
         sizes = [s.st_size if s else 0 for s in stats]
         perms = [s.st_mode if s else 0 for s in stats]
 
-        # find the newest file, checking also that they differ
         mod_times = [s.st_mtime if s else 0 for s in stats]
-        newest_index = mod_times.index( max(mod_times) )
-        if mod_times.count( max(mod_times) ) == len(mod_times):
-            newest_index = -1 # all same
+        existing_times = [s.st_mtime for s in stats if s]
+        newest_time = max(existing_times)
+        if existing_times.count(newest_time) == len(existing_times):
+            # If all actually-present files have the same mtime, don't
+            # pretend that any are "newer", and do the same if e.g.,
+            # there's only one file.
+            newest = set()
+        else:
+            newest = {i for i, t in enumerate(mod_times) if t == newest_time}
+
         all_present = 0 not in mod_times
         if all_present:
             all_same = self.file_compare(files, regexes)
@@ -1320,7 +1324,6 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
             all_present_same = self.file_compare(lof, regexes)
         different = 1
         one_isdir = [None for i in range(self.model.ntree)]
-        locale_encoding = locale.getpreferredencoding()
         for j in range(self.model.ntree):
             if mod_times[j]:
                 isdir = os.path.isdir( files[j] )
@@ -1339,16 +1342,15 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
                 # Different and DodgyDifferent
                 else:
                     self.model.set_path_state(it, j, tree.STATE_MODIFIED, isdir)
-                self.model.set_value(it,
-                    self.model.column_index(COL_EMBLEM, j),
-                    j == newest_index and "emblem-meld-newer-file" or None)
+                emblem = "emblem-meld-newer-file" if j in newest else None
+                self.model.set_value(
+                    it, self.model.column_index(COL_EMBLEM, j), emblem)
                 one_isdir[j] = isdir
 
                 # A DateCellRenderer would be nicer, but potentially very slow
                 TIME = self.model.column_index(COL_TIME, j)
                 mod_datetime = datetime.datetime.fromtimestamp(mod_times[j])
                 time_str = mod_datetime.strftime("%a %d %b %Y %H:%M:%S")
-                time_str = time_str.decode(locale_encoding, errors='replace')
                 self.model.set_value(it, TIME, time_str)
 
                 def natural_size(bytes):
@@ -1551,6 +1553,7 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
         for path in changed_paths:
             self._update_item_state( model.get_iter(path) )
         self._update_diffmaps()
+        self.force_cursor_recalculate = True
 
     def next_diff(self, direction):
         if self.focus_pane:

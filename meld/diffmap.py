@@ -18,7 +18,6 @@ import collections
 
 import cairo
 
-from gi.repository import GObject
 from gi.repository import Gdk
 from gi.repository import Gtk
 
@@ -31,7 +30,7 @@ class DiffMap(Gtk.DrawingArea):
     __gtype_name__ = "DiffMap"
 
     def __init__(self):
-        GObject.GObject.__init__(self)
+        Gtk.DrawingArea.__init__(self)
         self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
         self._scrolladj = None
         self._difffunc = lambda: None
@@ -121,9 +120,7 @@ class DiffMap(Gtk.DrawingArea):
         x0 = xpad
         x1 = width - 2 * xpad
 
-        # Hack to work around a cairo bug when calling create_similar
-        # https://bugs.freedesktop.org/show_bug.cgi?id=60519
-        if not (width and height):
+        if not (width > 0 and height > 0):
             return
 
         context.translate(0, y_start)

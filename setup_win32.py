@@ -130,8 +130,8 @@ setup(
     ],
     packages=[
         'meld',
+        'meld.matchers',
         'meld.ui',
-        'meld.util',
         'meld.vc',
     ],
     package_data={
